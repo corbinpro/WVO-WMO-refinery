@@ -1,0 +1,15 @@
+1: Update and complete parts list
+2: SRS
+  -numbered testable requirements. temps, flow rates, safety interlocks
+3: SDD (System Design Document)
+  -clean version of drawio with separate viewpoints for oil flow/physical parts, hardware/electrical, and software view
+  -ICD merged in here: UART protocol, GPIO pinouts, wiring diagram, sensor signal ranges
+  -covers everything except fabrication/CAD, which is tracked separately
+4: Hazard/Safety analysis (lightweight FEMA)
+  -tablem failure mode, effect mitigation
+5: Test/Verification Plan
+  -Maps to SRS
+6: Solid readme
+  -one page, polished, minimal
+7: Video documentation of build and testing
+
