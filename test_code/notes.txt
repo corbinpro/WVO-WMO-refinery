@@ -1,0 +1,37 @@
+GPIOtests notes
+===============
+
+2026-09-19  Tank level sender reads (A3/PB0 = Tank 1, A4/PC1 = Tank 2)
+------------------------------------------------------------------------
+Observed:
+  - Both senders read about -4% at the bottom, where they should read 0%.
+  - Reading jumps from about 45% straight down to -4% in the bottom inch
+    or so of float travel.
+
+What the numbers say:
+  - -4% is about 248 ohm, vs the 240 ohm "empty" value used in firmware.
+    ~8 ohm extra is ~30 ADC counts, so it is a real offset, not ADC noise.
+  - Both tanks show the same offset, so likely something shared:
+      * series resistance on the sender side (wires, connectors,
+        breadboard, float contact), and/or
+      * the two 100 ohm divider resistors (R1, R2) are +/-5%; ~97 ohm
+        actual would give the same offset.
+  - The 45% -> -4% jump is probably the sender itself: a reed sender is a
+    chain of resistors switched by reed contacts at fixed float positions,
+    so it reads in steps, not linearly. A linear 240 -> 33 ohm mapping
+    cannot represent a big gap near the bottom.
+
+Status: left as is. No clamping added (deliberate, so the real offset
+stays visible). Firmware still maps fill% linearly (240 ohm = 0%,
+33 ohm = 100%, LVL_R_FIXED = 100 ohm).
+
+To do later:
+  1. Measure the real R1/R2 values and set LVL_R_FIXED in main.c.
+  2. Disconnect the sender and measure across its two wires with a
+     multimeter, float at bottom and at top (expect ~240 and ~33 ohm).
+     If it matches, the extra ohms are in the wiring/connections.
+  3. Calibrate: at several known fill levels (empty, 25, 50, 75, full)
+     record the printed R and the true fill, then replace the linear
+     formula with a per-tank lookup table that interpolates between
+     the measured points.
+  4. Fritzing sketch: R1/R2 ground ends (GND13/GND14) are not wired yet.
