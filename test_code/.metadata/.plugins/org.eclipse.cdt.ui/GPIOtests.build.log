@@ -1,10 +1,10 @@
-14:17:14 **** Incremental Build of configuration Debug for project GPIOtests ****
+13:56:34 **** Incremental Build of configuration Debug for project GPIOtests ****
 make -j8 all 
 arm-none-eabi-size  GPIOtests.elf 
    text	   data	    bss	    dec	    hex	filename
-  32820	    172	   3844	  36836	   8fe4	GPIOtests.elf
+  35592	    204	   4428	  40224	   9d20	GPIOtests.elf
 Finished building: default.size.stdout
  
 
-14:17:14 Build Finished. 0 errors, 0 warnings. (took 130ms)
+13:56:34 Build Finished. 0 errors, 0 warnings. (took 68ms)
 

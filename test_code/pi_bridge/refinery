@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Attach this terminal to the refinery console (via refinery-bridge).
+
+Keys go straight to the STM32 console. Ctrl-] detaches (unless --kiosk).
+"""
+import os
+import selectors
+import socket
+import sys
+import termios
+import time
+import tty
+
+SOCK = os.environ.get("REFINERY_SOCK", "/run/refinery/bridge.sock")
+DETACH = b"\x1d"   # Ctrl-]
+
+
+def main():
+    kiosk = "--kiosk" in sys.argv[1:]
+    fd = sys.stdin.fileno()
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK)
+    except OSError as e:
+        print(f"refinery: bridge not running ({e}). Check: systemctl status refinery-bridge",
+              file=sys.stderr)
+        if kiosk:
+            time.sleep(5)   # let systemd restart us without spinning
+        return 1
+
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    out = sys.stdout.buffer
+    out.write(b"\x1b[?25l")   # hide cursor; the console draws its own prompt
+    out.flush()
+    sel = selectors.DefaultSelector()
+    sel.register(s, selectors.EVENT_READ, "sock")
+    sel.register(fd, selectors.EVENT_READ, "tty")
+    try:
+        while True:
+            for key, _ in sel.select():
+                if key.data == "sock":
+                    data = s.recv(4096)
+                    if not data:
+                        return 1
+                    out.write(data)
+                    out.flush()
+                else:
+                    data = os.read(fd, 256)
+                    if not data:
+                        return 0
+                    if not kiosk and DETACH in data:
+                        return 0
+                    s.sendall(data)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.write(b"\x1b[?25h\x1b[2J\x1b[H")   # cursor back, clear the console off the screen
+        out.flush()
+        s.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

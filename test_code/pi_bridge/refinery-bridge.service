@@ -1,0 +1,16 @@
+[Unit]
+Description=WVO/WMO refinery serial bridge (STM32 USART1 <-> clients)
+After=dev-serial0.device
+Wants=dev-serial0.device
+
+[Service]
+User=pi
+Group=dialout
+RuntimeDirectory=refinery
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/refinery-bridge
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

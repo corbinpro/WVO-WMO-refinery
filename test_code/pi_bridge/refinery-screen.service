@@ -1,0 +1,20 @@
+[Unit]
+Description=WVO/WMO refinery console on the HDMI screen (tty1)
+After=refinery-bridge.service systemd-user-sessions.service
+Requires=refinery-bridge.service
+Conflicts=getty@tty1.service
+Before=getty@tty1.service
+
+[Service]
+ExecStart=/usr/local/bin/refinery --kiosk
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

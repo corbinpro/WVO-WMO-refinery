@@ -48,8 +48,15 @@
 
 #define REFRESH_MS     250        /* console redraw period */
 #define RX_BUF         32         /* max command length */
-#define FRAME_SZ       1600       /* one-shot console frame buffer */
+#define FRAME_SZ       2048       /* one-shot console frame buffer */
 #define EOL            "\x1b[K\r\n"  /* clear to end of line, then newline */
+
+/* Commanded output state is saved here so it survives a reset / power cycle.
+ * Last 2K page of bank 2 - kept out of the FLASH region in STM32L476RGTX_FLASH.ld. */
+#define STATE_ADDR     0x080FF800UL
+#define STATE_BANK     FLASH_BANK_2
+#define STATE_PAGE     255
+#define STATE_MAGIC    0x57564F00UL  /* "WVO\0" in the upper word, output bits in the lower */
 
 /* USER CODE END PD */
 
@@ -61,41 +68,44 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 static uint32_t adc_raw[N_CH]; /* T1 A0/PA0, T2 A1/PA1, NOZ A2/PA4, LVL1 A3/PB0, LVL2 A4/PC1 */
 
-/* Serial command input (filled by the USART2 RX interrupt) */
+/* Serial command input from the RPi (filled by the USART1 RX interrupt) */
 static uint8_t rx_byte;
 static char rx_buf[RX_BUF];
 static volatile uint8_t rx_len;
 static char cmd_line[RX_BUF];
 static volatile uint8_t cmd_ready;
 static volatile uint8_t ui_dirty = 1;
-static char last_msg[64] = "Ready. Type a command, e.g. h1 on";
+static char last_msg[64] = "Ready. Type a command, e.g. t1";
 
 /* Console frame is built in one buffer and sent in one transmit (no flicker) */
 static char frame[FRAME_SZ];
 static size_t fpos;
 
-/* Controllable outputs. on_level = pin level that turns the device ON.
- * Solenoid relay boards assumed active-HIGH; change to GPIO_PIN_RESET if yours are active-LOW. */
+/* Outputs. on_level = pin level that turns the device ON.
+ * Relay boards assumed active-HIGH; change to GPIO_PIN_RESET if yours are active-LOW.
+ * name == NULL: no command, the output is forced ON at boot (tank heaters). */
 typedef struct {
   const char    *name;      /* serial command name */
   const char    *label;     /* shown on the console */
+  const char    *help;      /* what the command does */
   GPIO_TypeDef  *port;
   uint16_t       pin;
   GPIO_PinState  on_level;
 } Output_t;
 
 static const Output_t outputs[] = {
-  { "t1",   "T1 solenoid",   RELAY_D2_GPIO_Port, RELAY_D2_Pin, GPIO_PIN_SET },
-  { "t2",   "T2 solenoid",   RELAY_D3_GPIO_Port, RELAY_D3_Pin, GPIO_PIN_SET },
-  { "h1",   "T1 heater",     HTR_T1_GPIO_Port,   HTR_T1_Pin,   GPIO_PIN_SET },
-  { "h2",   "T2 heater",     HTR_T2_GPIO_Port,   HTR_T2_Pin,   GPIO_PIN_SET },
-  { "hnoz", "Nozzle heater", HTR_NOZ_GPIO_Port,  HTR_NOZ_Pin,  GPIO_PIN_SET },
-  { "cent", "Centrifuge",    MOTOR_GPIO_Port,    MOTOR_Pin,    GPIO_PIN_SET },
+  { "t1",  "Tank 1 valves", "toggle Tank 1 valves (upper + lower)", RELAY_D2_GPIO_Port, RELAY_D2_Pin, GPIO_PIN_SET },
+  { "t2",  "Tank 2 valves", "toggle Tank 2 valves (upper + lower)", RELAY_D3_GPIO_Port, RELAY_D3_Pin, GPIO_PIN_SET },
+  { "htr", "Nozzle heater", "toggle nozzle heater",                 HTR_NOZ_GPIO_Port,  HTR_NOZ_Pin,  GPIO_PIN_SET },
+  { "cent","Centrifuge",    "toggle centrifuge motor",              MOTOR_GPIO_Port,    MOTOR_Pin,    GPIO_PIN_SET },
+  { NULL,  "Tank 1 heater", NULL,                                   HTR_T1_GPIO_Port,   HTR_T1_Pin,   GPIO_PIN_SET },
+  { NULL,  "Tank 2 heater", NULL,                                   HTR_T2_GPIO_Port,   HTR_T2_Pin,   GPIO_PIN_SET },
 };
 #define N_OUT (sizeof(outputs) / sizeof(outputs[0]))
 
@@ -106,6 +116,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -113,12 +124,69 @@ static void MX_ADC1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* Route printf to USART2 (ST-LINK virtual COM port) */
+/* Route printf to USART2 (ST-LINK virtual COM port) - debug only, the console is on USART1 */
 int __io_putchar(int ch)
 {
   uint8_t c = (uint8_t)ch;
   HAL_UART_Transmit(&huart2, &c, 1, HAL_MAX_DELAY);
   return ch;
+}
+
+static void set_output(size_t i, int on)
+{
+  GPIO_PinState off_level = (outputs[i].on_level == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+  HAL_GPIO_WritePin(outputs[i].port, outputs[i].pin, on ? outputs[i].on_level : off_level);
+}
+
+static int output_is_on(size_t i)
+{
+  /* ReadPin reads IDR, which reflects the driven level of an output pin */
+  return HAL_GPIO_ReadPin(outputs[i].port, outputs[i].pin) == outputs[i].on_level;
+}
+
+/* Bit i set = commandable output i is ON */
+static uint32_t command_bits(void)
+{
+  uint32_t bits = 0;
+  for (size_t i = 0; i < N_OUT; i++)
+  {
+    if (outputs[i].name != NULL && output_is_on(i)) bits |= 1UL << i;
+  }
+  return bits;
+}
+
+/* Restore commanded outputs from flash. Erased/unknown record = all OFF. */
+static void load_state(void)
+{
+  uint64_t rec = *(volatile const uint64_t *)STATE_ADDR;
+  if ((uint32_t)(rec >> 32) != STATE_MAGIC) return;
+  for (size_t i = 0; i < N_OUT; i++)
+  {
+    if (outputs[i].name != NULL) set_output(i, (int)((rec >> i) & 1U));
+  }
+}
+
+/* Write the commanded state to flash (only if it changed). Returns 0 on success. */
+static int save_state(void)
+{
+  uint64_t rec = ((uint64_t)STATE_MAGIC << 32) | command_bits();
+  if (*(volatile const uint64_t *)STATE_ADDR == rec) return 0;
+
+  FLASH_EraseInitTypeDef erase = {
+    .TypeErase = FLASH_TYPEERASE_PAGES,
+    .Banks     = STATE_BANK,
+    .Page      = STATE_PAGE,
+    .NbPages   = 1,
+  };
+  uint32_t bad_page;
+  HAL_StatusTypeDef st;
+
+  HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);     /* stale flags (e.g. PGSERR) block programming */
+  st = HAL_FLASHEx_Erase(&erase, &bad_page);
+  if (st == HAL_OK) st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, STATE_ADDR, rec);
+  HAL_FLASH_Lock();
+  return (st == HAL_OK) ? 0 : -1;
 }
 
 /* Average N_SAMPLES scans of the N_CH channels (order = ADC rank order) */
@@ -208,16 +276,24 @@ static void render_ui(void)
   emit(" OUTPUTS" EOL);
   for (size_t i = 0; i < N_OUT; i++)
   {
-    int on = (HAL_GPIO_ReadPin(outputs[i].port, outputs[i].pin) == outputs[i].on_level);
-    emit("   %-13s: %s     [%s on|off]" EOL, outputs[i].label, on ? "ON " : "OFF", outputs[i].name);
+    emit("   %-13s: %s   %s" EOL, outputs[i].label, output_is_on(i) ? "ON " : "OFF",
+         outputs[i].name ? "" : "(always on)");
   }
+  emit(EOL);
+  emit(" COMMANDS  (type, then Enter)" EOL);
+  for (size_t i = 0; i < N_OUT; i++)
+  {
+    if (outputs[i].name != NULL) emit("   %-5s %s" EOL, outputs[i].name, outputs[i].help);
+  }
+  emit("   add 'on' or 'off' to force a state, e.g. 't1 off'" EOL);
+  emit("   settings are saved; USB can be unplugged after" EOL);
   emit(" ------------------------------------------------" EOL);
   emit(" %s" EOL, last_msg);
   emit(" > %.*s\x1b[K\x1b[J", (int)rx_len, rx_buf);  /* prompt + typed text, clear the rest */
-  HAL_UART_Transmit(&huart2, (uint8_t *)frame, (uint16_t)fpos, HAL_MAX_DELAY);
+  HAL_UART_Transmit(&huart1, (uint8_t *)frame, (uint16_t)fpos, HAL_MAX_DELAY);
 }
 
-/* "<name> on|off", case-insensitive */
+/* "<name>" toggles, "<name> on|off" forces; case-insensitive */
 static void handle_command(char *line)
 {
   for (char *p = line; *p; p++) *p = (char)tolower((unsigned char)*p);
@@ -226,23 +302,26 @@ static void handle_command(char *line)
   char *extra = strtok(NULL, " \t");
   if (name == NULL) return;
 
-  if (arg == NULL || extra != NULL || (strcmp(arg, "on") != 0 && strcmp(arg, "off") != 0))
-  {
-    snprintf(last_msg, sizeof last_msg, "ERR: use '<name> on' or '<name> off'");
-    return;
-  }
   for (size_t i = 0; i < N_OUT; i++)
   {
-    if (strcmp(name, outputs[i].name) == 0)
+    if (outputs[i].name == NULL || strcmp(name, outputs[i].name) != 0) continue;
+
+    int on;
+    if (arg == NULL)                                  on = !output_is_on(i);
+    else if (extra == NULL && strcmp(arg, "on") == 0)  on = 1;
+    else if (extra == NULL && strcmp(arg, "off") == 0) on = 0;
+    else
     {
-      int on = (strcmp(arg, "on") == 0);
-      GPIO_PinState off_level = (outputs[i].on_level == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-      HAL_GPIO_WritePin(outputs[i].port, outputs[i].pin, on ? outputs[i].on_level : off_level);
-      snprintf(last_msg, sizeof last_msg, "OK: %s %s", outputs[i].label, on ? "ON" : "OFF");
+      snprintf(last_msg, sizeof last_msg, "ERR: use '%s', '%s on' or '%s off'",
+               outputs[i].name, outputs[i].name, outputs[i].name);
       return;
     }
+    set_output(i, on);
+    snprintf(last_msg, sizeof last_msg, "OK: %s %s%s", outputs[i].label, on ? "ON" : "OFF",
+             save_state() == 0 ? "" : "  (WARNING: not saved to flash)");
+    return;
   }
-  snprintf(last_msg, sizeof last_msg, "ERR: unknown '%.20s'", name);
+  snprintf(last_msg, sizeof last_msg, "ERR: unknown '%.20s' (commands: t1 t2 htr cent)", name);
 }
 /* USER CODE END 0 */
 
@@ -277,21 +356,22 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* All outputs start OFF (correct level for each device) */
+  /* Tank heaters always ON; commanded outputs OFF, then restored from the last saved state */
   for (size_t i = 0; i < N_OUT; i++)
   {
-    GPIO_PinState off_level = (outputs[i].on_level == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-    HAL_GPIO_WritePin(outputs[i].port, outputs[i].pin, off_level);
+    set_output(i, outputs[i].name == NULL);
   }
+  load_state();
   if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
   {
     Error_Handler();
   }
-  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);         /* start interrupt-driven command input */
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);         /* start interrupt-driven command input (RPi) */
   {
     static const char clr[] = "\x1b[2J\x1b[H";       /* clear screen once */
-    HAL_UART_Transmit(&huart2, (uint8_t *)clr, sizeof clr - 1, HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart1, (uint8_t *)clr, sizeof clr - 1, HAL_MAX_DELAY);
   }
   uint32_t last_ui = 0;
 
@@ -469,6 +549,41 @@ static void MX_ADC1_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -564,10 +679,10 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-/* USART2 RX interrupt: build a command line one character at a time */
+/* USART1 RX interrupt: build a command line one character at a time */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if (huart->Instance == USART2)
+  if (huart->Instance == USART1)
   {
     char c = (char)rx_byte;
     if (c == '\r' || c == '\n')
@@ -596,7 +711,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 /* On any UART error (e.g. overrun) keep listening */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-  if (huart->Instance == USART2)
+  if (huart->Instance == USART1)
   {
     HAL_UART_Receive_IT(huart, &rx_byte, 1);
   }

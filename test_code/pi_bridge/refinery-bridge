@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Serial bridge between the STM32 console (USART1) and any number of local clients.
+
+Owns /dev/serial0 (RPi GPIO14/15 <-> STM32 PB7/PB6). The STM32 redraws every 250ms;
+the bridge forwards one whole frame every REFRESH_S seconds to every client on the
+Unix socket, and every frame for TYPING_S after a keystroke so typing stays responsive.
+Every byte a client sends is forwarded to the STM32. Clients are the `refinery`
+command (SSH sessions, HDMI screen).
+"""
+import os
+import selectors
+import socket
+import sys
+import time
+
+import serial
+
+PORT = os.environ.get("REFINERY_PORT", "/dev/serial0")
+BAUD = int(os.environ.get("REFINERY_BAUD", "115200"))
+SOCK = os.environ.get("REFINERY_SOCK", "/run/refinery/bridge.sock")
+REFRESH_S = float(os.environ.get("REFINERY_REFRESH_S", "3"))
+TYPING_S = 1.0            # after a keystroke, pass every frame through for this long
+FRAME_END = b"\x1b[J"     # the STM32 ends every redraw with clear-to-end-of-screen
+MAX_FRAME = 8192          # cap on the partial-frame buffer if a frame end never arrives
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def open_serial():
+    while True:
+        try:
+            ser = serial.Serial(PORT, BAUD, timeout=0)
+            ser.reset_input_buffer()
+            log(f"opened {PORT} @ {BAUD}")
+            return ser
+        except serial.SerialException as e:
+            log(f"cannot open {PORT}: {e}; retrying in 2s")
+            time.sleep(2)
+
+
+def main():
+    os.makedirs(os.path.dirname(SOCK), exist_ok=True)
+    try:
+        os.unlink(SOCK)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK)
+    os.chmod(SOCK, 0o660)
+    srv.listen(8)
+    srv.setblocking(False)
+
+    sel = selectors.DefaultSelector()
+    sel.register(srv, selectors.EVENT_READ, "accept")
+    ser = open_serial()
+    sel.register(ser, selectors.EVENT_READ, "serial")
+
+    clients = set()
+    partial = b""      # bytes of the frame currently arriving
+    newest = None      # newest complete frame not yet sent to clients
+    last_frame = b""   # newest complete frame, replayed to new clients
+    last_sent = 0.0
+    last_key = 0.0
+
+    def drop(c):
+        clients.discard(c)
+        try:
+            sel.unregister(c)
+        except (KeyError, ValueError):
+            pass
+        c.close()
+
+    while True:
+        for key, _ in sel.select(timeout=0.1):
+            if key.data == "accept":
+                c, _ = srv.accept()
+                c.setblocking(False)
+                try:
+                    c.sendall(b"\x1b[2J" + last_frame)   # clear, then show the latest frame
+                except OSError:
+                    c.close()
+                    continue
+                clients.add(c)
+                sel.register(c, selectors.EVENT_READ, "client")
+
+            elif key.data == "serial":
+                try:
+                    data = ser.read(4096)
+                except serial.SerialException as e:
+                    log(f"serial error: {e}")
+                    sel.unregister(ser)
+                    ser.close()
+                    ser = open_serial()
+                    sel.register(ser, selectors.EVENT_READ, "serial")
+                    continue
+                if not data:
+                    continue
+                partial += data
+                i = partial.rfind(FRAME_END)
+                if i >= 0:
+                    j = partial.rfind(FRAME_END, 0, i)   # keep only the newest whole frame
+                    newest = partial[j + len(FRAME_END) if j >= 0 else 0:i + len(FRAME_END)]
+                    last_frame = newest
+                    partial = partial[i + len(FRAME_END):]
+                partial = partial[-MAX_FRAME:]
+
+            else:   # client keystrokes -> STM32
+                c = key.fileobj
+                try:
+                    data = c.recv(256)
+                except OSError:
+                    data = b""
+                if not data:
+                    drop(c)
+                    continue
+                last_key = time.monotonic()
+                try:
+                    ser.write(data)
+                except serial.SerialException as e:
+                    log(f"serial write error: {e}")
+
+        now = time.monotonic()
+        if newest is not None and (now - last_sent >= REFRESH_S or now - last_key < TYPING_S):
+            for c in list(clients):
+                try:
+                    c.send(newest)   # non-blocking; a client that can't keep up is dropped
+                except (BlockingIOError, OSError):
+                    drop(c)
+            newest = None
+            last_sent = now
+
+
+if __name__ == "__main__":
+    main()
