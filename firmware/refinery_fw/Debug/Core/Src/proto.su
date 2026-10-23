@@ -1,0 +1,8 @@
+../Core/Src/proto.c:10:16:xor_sum	24	static
+../Core/Src/proto.c:18:15:frame	40	static
+../Core/Src/proto.c:24:12:hexval	16	static
+../Core/Src/proto.c:33:12:num	24	static
+../Core/Src/proto.c:41:20:dispatch	48	static
+../Core/Src/proto.c:73:8:proto_handle_line	360	static
+../Core/Src/proto.c:105:14:put_reading	32	static
+../Core/Src/proto.c:112:8:proto_status	280	static

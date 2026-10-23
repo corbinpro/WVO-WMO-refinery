@@ -1,0 +1,8 @@
+../Core/Src/proto.c:10:16:xor_sum	2
+../Core/Src/proto.c:18:15:frame	3
+../Core/Src/proto.c:24:12:hexval	7
+../Core/Src/proto.c:33:12:num	2
+../Core/Src/proto.c:41:20:dispatch	30
+../Core/Src/proto.c:73:8:proto_handle_line	16
+../Core/Src/proto.c:105:14:put_reading	4
+../Core/Src/proto.c:112:8:proto_status	8

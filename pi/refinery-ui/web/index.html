@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Refinery</title>
+<style>
+/* btop "Default" theme colours */
+:root{--bg:#000;--fg:#ccc;--title:#eee;--dim:#808080;--dot:#303030;--sel:#6a2f2f;
+ --t1:#3d7b46;--t2:#8a882e;--cf:#423ba5;--cam:#923535;
+ --on:#50d26e;--heat:#ff9628;--warn:#ffc828;--bad:#e63c32}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.25 "DejaVu Sans Mono",ui-monospace,Menlo,Consolas,monospace}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:14px 10px;padding:10px}
+fieldset{border:1px solid var(--c);border-radius:8px;margin:0;padding:6px 10px 10px;position:relative;min-width:0}
+legend{padding:0;color:var(--title);font-weight:700}
+legend::before{content:"┐";color:var(--c)}legend::after{content:"┌";color:var(--c)}
+.rt{position:absolute;top:-1.15em;right:12px;background:var(--bg);padding:0;line-height:1.25}
+.rt::before{content:"┐";color:var(--c)}.rt::after{content:"┌";color:var(--c)}
+.bl{position:absolute;bottom:-.65em;left:12px;background:var(--bg);color:var(--dim);max-width:70%;overflow:hidden;white-space:nowrap}
+.bl::before{content:"┘";color:var(--c)}.bl::after{content:"└";color:var(--c)}
+#flags::before{content:"┘"}#flags::after{content:"└"}
+.row{display:flex;gap:10px;align-items:baseline;justify-content:space-between;flex-wrap:wrap}
+.big{font-size:28px;font-weight:700}
+.dim{color:var(--dim)}.on{color:var(--on)}.heat{color:var(--heat)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+pre{margin:6px 0;font:inherit;line-height:1.05;overflow:hidden;white-space:pre}
+.ctl{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
+.ctl label{display:flex;flex-direction:column;font-size:12px;color:var(--dim);gap:2px}
+.w2{grid-column:span 2}
+button,select,input{font:inherit;font-size:16px;background:var(--bg);color:var(--title);border:1px solid var(--c);border-radius:6px;padding:8px 6px;min-height:42px;width:100%}
+select option{background:var(--bg)}
+button:disabled{color:var(--dim)}
+:focus{outline:2px solid #fff;outline-offset:1px;background:var(--sel)}
+#video{width:100%;max-width:640px;aspect-ratio:4/3;background:#000;display:block;border-radius:6px;margin-top:6px}
+#fire{display:none;position:fixed;inset:0;background:#280000;color:#fff;z-index:9;text-align:center;padding:40px 16px}
+#fire h2{font-size:36px;margin:0 0 16px;color:var(--bad)}
+</style>
+</head>
+<body>
+<div id="fire"><h2>FIRE DETECTED</h2><p id="firestate" class="warn"></p><p>heaters, centrifuge and valves are off</p>
+<p><b>Replace fire extinguisher and clean machine.</b></p><p class="dim">The fault can only be cleared at the machine.</p></div>
+<main>
+<fieldset id="t0" style="--c:var(--t1)"></fieldset>
+<fieldset id="t1" style="--c:var(--t2)"></fieldset>
+<fieldset style="--c:var(--cf)"><legend>centrifuge</legend><span class="rt" id="cent"></span>
+ <div class="row"><span><span class="dim">nozzle </span><b class="big" id="noz" style="font-size:22px"></b>
+  <span class="dim" id="nozt"></span> <span id="nozh" class="heat"></span></span><span id="drain" class="on"></span></div>
+ <pre id="g2"></pre>
+ <div id="warnings" class="warn"></div>
+ <div class="ctl">
+  <label>centrifuge<button data-nav id="b_cent" onclick="ovr('CENT',1)"></button></label>
+  <label class="w2">nozzle target<select data-nav id="s_noz" onchange="send('NOZ,'+this.value)">
+   <option value="160">160 F</option><option value="170">170 F</option><option value="180">180 F</option></select></label>
+  <label>nozzle htr<button data-nav id="b_noz" onclick="ovr('NOZ',2)"></button></label>
+ </div>
+ <span class="bl" id="msg"></span><span class="rt" id="flags" style="top:auto;bottom:-.65em"></span>
+</fieldset>
+<fieldset style="--c:var(--cam)"><legend>camera</legend>
+ <div class="ctl"><button data-nav id="b_cam" onclick="cam(!camOn)"></button><button data-nav id="b_snd" onclick="snd(!sndOn)"></button></div>
+ <img id="video" alt="webcam">
+</fieldset>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const TS=['idle','settling','ready','draining'],CS=['stopped','spinning up','running','run-out'];
+const FS=['','extinguisher firing','extinguisher pause','extinguisher retracting','latched'];
+const LO=400,HI=2000;                         /* graph range, tenths of F (same as the screen) */
+let st=null,camOn=true,sndOn=false,editing=null,audio=null;
+function t10(v){return v==null?'-- F':(v/10).toFixed(1)+' F'}
+function hms(s){return Math.floor(s/3600)+':'+String(Math.floor(s/60)%60).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
+function hhmm(s){return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor(s/60)%60).padStart(2,'0')}
+/* colour gradients, t = 0..1 */
+function mix(a,b,t){return a.map((x,i)=>Math.round(x+(b[i]-x)*t))}
+function g3(a,b,c,t){t=Math.max(0,Math.min(1,t));const m=t<.5?mix(a,b,t*2):mix(b,c,t*2-1);return`rgb(${m})`}
+const tempG=t=>g3([0x48,0x97,0xd4],[0x54,0x74,0xe8],[0xff,0x40,0xb6],t);
+const levelG=t=>g3([0x38,0x4f,0x21],[0xb5,0xe6,0x85],[0xdc,0xff,0x85],t);
+const tempC=v=>v==null?'var(--dim)':tempG((v-LO)/(HI-LO));
+/* Braille: one char = 2 columns x 4 rows of dots */
+const LBIT=[0x40,0x04,0x02,0x01],RBIT=[0x80,0x20,0x10,0x08];   /* bottom-to-top dot bits */
+function graph(vals,rows){                     /* bar graph, newest at the right */
+ const dots=rows*4,h=vals.map(v=>v==null?0:Math.max(1,Math.min(dots,Math.round((v-LO)*dots/(HI-LO)))));
+ if(h.length%2)h.unshift(0);
+ let out='';
+ for(let r=rows-1;r>=0;r--){
+  let line='';
+  for(let i=0;i<h.length;i+=2){let b=0;for(let d=0;d<4;d++){const lvl=r*4+d+1;if(h[i]>=lvl)b|=LBIT[d];if(h[i+1]>=lvl)b|=RBIT[d]}
+   line+=String.fromCharCode(0x2800+b)}
+  out+=`<span style="color:${tempG((r+.5)/rows)}">${line}</span>\n`}
+ return out}
+function meter(pm,n){                          /* horizontal braille bar */
+ const f=Math.max(0,Math.min(n,Math.round(pm*n/1000)));let s='';
+ for(let i=0;i<n;i++)s+=`<span style="color:${i<f?levelG(i/n):'var(--dot)'}">⣿</span>`;return s}
+async function send(c){
+ try{const r=await fetch('cmd',{method:'POST',body:c,headers:{'X-Refinery':'1'}});if(!r.ok)$('msg').textContent=c+': '+(await r.text())}
+ catch(e){$('msg').textContent='send failed: '+e}
+ setTimeout(poll,300)}
+function ovr(n,bit){send('OVR,'+n+','+((st.ovr&bit)?'OFF':'ON'))}
+function setTime(t){
+ const m=/^(\d{1,2}):?(\d{2})$/.exec($('i_time'+t).value.trim());
+ if(!m||+m[2]>59||(+m[1]==0&&+m[2]==0)){$('msg').textContent='timer must be HH:MM, 00:01-99:59';return}
+ editing=null;send('TIME,'+(t+1)+','+((+m[1])*3600+(+m[2])*60))}
+function tankHTML(t){return `<legend>tank ${t+1}</legend><span class="rt" id="st${t}"></span>
+ <div class="row"><span><b class="big" id="tp${t}"></b> <span class="dim" id="sp${t}"></span></span><span id="ht${t}"></span></div>
+ <pre id="g${t}"></pre>
+ <div class="row"><span class="dim">level</span><pre id="lb${t}" style="margin:0;flex:1"></pre><span id="lv${t}"></span></div>
+ <div class="ctl">
+  <label>set temp<select data-nav id="s_temp${t}" onchange="send('TEMP,${t+1},'+this.value)">
+   <option value="0">no heat</option><option value="120">120 F</option><option value="160">160 F</option><option value="175">175 F</option></select></label>
+  <label>timer hh:mm<input data-nav id="i_time${t}" inputmode="numeric" maxlength="5"
+   onfocus="editing=${t}" onblur="editing=null" onkeydown="if(event.key=='Enter')setTime(${t})"></label>
+  <label class="w2">&nbsp;<button data-nav onclick="setTime(${t})">set timer</button></label>
+  <label>&nbsp;<button data-nav id="b_start${t}" class="on" onclick="send('START,${t+1}')">start</button></label>
+  <label>&nbsp;<button data-nav id="b_cancel${t}" class="bad" onclick="send('CANCEL,${t+1}')">cancel</button></label>
+  <label>valves<button data-nav id="b_v${t}" onclick="ovr('V${t+1}',${t?8:4})"></button></label>
+  <label>heater<button data-nav id="b_h${t}" onclick="ovr('H${t+1}',${t?32:16})"></button></label>
+ </div>`}
+$('t0').innerHTML=tankHTML(0);$('t1').innerHTML=tankHTML(1);
+function tog(id,on,cls){$(id).textContent=on?'on':'auto';$(id).className=on?cls:''}
+function render(){
+ const s=st,ok=s.link;
+ $('fire').style.display=s.fire?'block':'none';$('firestate').textContent=FS[s.fire]||'';
+ $('msg').textContent=s.msg;
+ let fl=[];if(!ok)fl.push(`<span class="bad">${s.have?'no data from controller':'waiting for controller'}</span>`);
+ else if(s.warn&2)fl.push('<span class="warn">fire detection off</span>');$('flags').innerHTML=fl.join(' ');$('flags').style.display=fl.length?'':'none';
+ for(let t=0;t<2;t++){
+  const k=s.tank[t],oot=s.oot&(1<<t),tv=ok?s.temp[t]:null;
+  $('st'+t).textContent=!ok?'no data':k.state==1?'settling '+hms(k.remain):(k.state==2&&s.drain?'ready - waiting':TS[k.state]);
+  $('st'+t).className='rt '+(!ok?'bad':['dim','heat','warn','on'][k.state]);
+  $('tp'+t).textContent=t10(tv);$('tp'+t).style.color=oot?'var(--warn)':tempC(tv);
+  $('sp'+t).textContent=k.preset?'set '+k.preset+' F':'no heat';
+  const h=s.out&(t?8:4);$('ht'+t).textContent=(h?'heater on':'heater off')+(oot?' - out of tolerance':'');$('ht'+t).className=h?'heat':'dim';
+  $('g'+t).innerHTML=graph(s.hist[t],4);
+  const lv=ok?s.level[t]:null;$('lb'+t).innerHTML=meter(lv==null?0:lv,30);
+  $('lv'+t).textContent=lv==null?'no sender':(lv/10).toFixed(1)+'%';$('lv'+t).className=lv==null?'bad':'';
+  const sel=$('s_temp'+t);if(document.activeElement!==sel)sel.value=k.preset;
+  if(editing!==t)$('i_time'+t).value=hhmm(k.timer);
+  $('b_start'+t).disabled=k.state!=0;$('b_cancel'+t).disabled=k.state==0;
+  tog('b_v'+t,s.ovr&(t?8:4),'on');if(s.out&(t?2:1))$('b_v'+t).textContent+='*';
+  tog('b_h'+t,s.ovr&(t?32:16),'heat')}
+ $('cent').textContent=ok?CS[s.cent]:'no data';$('cent').className='rt '+(!ok?'bad':s.cent?'on':'dim');
+ $('drain').textContent=s.drain?'draining tank '+s.drain:'';
+ const nv=ok?s.temp[2]:null;$('noz').textContent=t10(nv);$('noz').style.color=(s.oot&4)?'var(--warn)':tempC(nv);
+ $('nozt').textContent='target '+s.noz+' F';$('nozh').textContent=(s.out&16)?'heater on':'';
+ $('g2').innerHTML=graph(s.hist[2],2);
+ if(document.activeElement!==$('s_noz'))$('s_noz').value=s.noz;
+ tog('b_cent',s.ovr&1,'on');tog('b_noz',s.ovr&2,'heat');}
+async function poll(){
+ try{const r=await fetch('status',{cache:'no-store'});st=await r.json();render()}
+ catch(e){$('flags').innerHTML='<span class="bad">pi not reachable</span>';$('flags').style.display=''}}
+function cam(on){camOn=on;$('video').style.display=on?'block':'none';$('video').src=on?'video/stream':'';$('b_cam').textContent=on?'video on':'video off'}
+/* Sound: browsers only allow it after a click. Restart the stream if it stalls. */
+function snd(on){sndOn=on;$('b_snd').textContent=on?'sound on':'sound off';
+ if(audio){audio.pause();audio.src='';audio=null}
+ if(on){audio=new Audio('audio?'+Date.now());audio.play().catch(e=>{$('msg').textContent='sound blocked: '+e});
+  audio.onerror=audio.onended=()=>{if(sndOn)setTimeout(()=>snd(true),1000)}}}
+/* Arrow keys move focus between controls (REQ-UI-070), nearest in that direction */
+document.addEventListener('keydown',e=>{
+ const d={ArrowUp:[0,-1],ArrowDown:[0,1],ArrowLeft:[-1,0],ArrowRight:[1,0]}[e.key];if(!d)return;
+ const a=document.activeElement;
+ if(a&&a.tagName=='SELECT'&&d[1])return;
+ if(a&&a.tagName=='INPUT'&&d[0])return;
+ const els=[...document.querySelectorAll('[data-nav]')].filter(x=>!x.disabled&&x.offsetParent);
+ if(!els.includes(a)){els[0]&&els[0].focus();e.preventDefault();return}
+ const r=a.getBoundingClientRect(),ax=r.x+r.width/2,ay=r.y+r.height/2;
+ let best=null,bc=1e9;
+ for(const x of els){if(x===a)continue;const b=x.getBoundingClientRect(),dx=b.x+b.width/2-ax,dy=b.y+b.height/2-ay;
+  const along=d[0]?dx*d[0]:dy*d[1],side=Math.abs(d[0]?dy:dx);if(along<=0)continue;
+  const c=along+3*side;if(c<bc){bc=c;best=x}}
+ if(best){best.focus();e.preventDefault()}});
+cam(true);snd(false);poll();setInterval(poll,1000);
+</script>
+</body>
+</html>

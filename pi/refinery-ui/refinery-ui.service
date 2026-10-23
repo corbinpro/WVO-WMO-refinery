@@ -1,0 +1,24 @@
+[Unit]
+Description=WVO/WMO refinery operator UI (HDMI screen, keypad, web on 127.0.0.1:8000)
+After=dev-serial0.device ustreamer.service systemd-user-sessions.service
+Wants=dev-serial0.device
+Conflicts=getty@tty1.service
+Before=getty@tty1.service
+
+[Service]
+User=pi
+SupplementaryGroups=video input dialout tty audio
+# tty1 is our controlling terminal so we may switch it to graphics mode (stops console text over the UI)
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+# --rotate 90 or 270, whichever puts the picture upright on the mounted screen
+ExecStart=/usr/local/bin/refinery-ui --serial /dev/serial0 --rotate 270 --http 127.0.0.1:8000
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
